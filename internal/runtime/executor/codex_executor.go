@@ -139,7 +139,117 @@ func logCodexRawJSON(ctx context.Context, stage string, model string, payload []
 	entry.Infof("rawjson=%s", string(trimmed))
 }
 
-func requestBodyBytesForLog(req *http.Request) []byte {
+func logCodexRequestBodyReadError(ctx context.Context, stage string, model string, req *http.Request, err error) {
+	if err == nil {
+		return
+	}
+	fields := log.Fields{
+		"provider": "codex",
+		"stage":    strings.TrimSpace(stage),
+	}
+	if trimmedModel := strings.TrimSpace(model); trimmedModel != "" {
+		fields["model"] = trimmedModel
+	}
+	for key, value := range codexRequestLogFields(req) {
+		fields[key] = value
+	}
+	helps.LogWithRequestID(ctx).WithFields(fields).WithError(err).Warn("codex executor: failed to read request body for logging")
+}
+
+func logCodexResponseBodyReadError(ctx context.Context, stage string, model string, httpResp *http.Response, partialBody []byte, err error) {
+	if err == nil {
+		return
+	}
+	fields := log.Fields{
+		"provider":      "codex",
+		"stage":         strings.TrimSpace(stage),
+		"partial_bytes": len(partialBody),
+	}
+	if trimmedModel := strings.TrimSpace(model); trimmedModel != "" {
+		fields["model"] = trimmedModel
+	}
+	for key, value := range codexResponseLogFields(httpResp) {
+		fields[key] = value
+	}
+	helps.LogWithRequestID(ctx).WithFields(fields).WithError(err).Error("codex executor: failed to read upstream response body")
+}
+
+func codexRequestLogFields(req *http.Request) log.Fields {
+	fields := log.Fields{}
+	if req == nil {
+		return fields
+	}
+	if method := strings.TrimSpace(req.Method); method != "" {
+		fields["upstream_method"] = method
+	}
+	if req.ContentLength >= 0 {
+		fields["request_content_length"] = req.ContentLength
+	}
+	if contentType := strings.TrimSpace(req.Header.Get("Content-Type")); contentType != "" {
+		fields["request_content_type"] = contentType
+	}
+	if req.URL != nil {
+		if scheme := strings.TrimSpace(req.URL.Scheme); scheme != "" {
+			fields["upstream_scheme"] = scheme
+		}
+		if host := strings.TrimSpace(req.URL.Host); host != "" {
+			fields["upstream_host"] = host
+		}
+		if path := strings.TrimSpace(req.URL.Path); path != "" {
+			fields["upstream_path"] = path
+		}
+		if maskedQuery := strings.TrimSpace(util.MaskSensitiveQuery(req.URL.RawQuery)); maskedQuery != "" {
+			fields["upstream_query"] = maskedQuery
+		}
+	}
+	if requestID := strings.TrimSpace(req.Header.Get("X-Client-Request-Id")); requestID != "" {
+		fields["client_request_id"] = requestID
+	}
+	return fields
+}
+
+func codexResponseLogFields(httpResp *http.Response) log.Fields {
+	fields := log.Fields{}
+	if httpResp == nil {
+		return fields
+	}
+	if httpResp.StatusCode > 0 {
+		fields["status_code"] = httpResp.StatusCode
+	}
+	if httpResp.ContentLength >= 0 {
+		fields["response_content_length"] = httpResp.ContentLength
+	}
+	if contentType := strings.TrimSpace(httpResp.Header.Get("Content-Type")); contentType != "" {
+		fields["response_content_type"] = contentType
+	}
+	if contentEncoding := strings.TrimSpace(httpResp.Header.Get("Content-Encoding")); contentEncoding != "" {
+		fields["response_content_encoding"] = contentEncoding
+	}
+	if transferEncoding := strings.TrimSpace(strings.Join(httpResp.TransferEncoding, ",")); transferEncoding != "" {
+		fields["response_transfer_encoding"] = transferEncoding
+	}
+	if upstreamRequestID := codexHeaderValue(httpResp.Header, "X-Request-Id", "OpenAI-Request-ID", "Request-Id"); upstreamRequestID != "" {
+		fields["upstream_request_id"] = upstreamRequestID
+	}
+	for key, value := range codexRequestLogFields(httpResp.Request) {
+		fields[key] = value
+	}
+	return fields
+}
+
+func codexHeaderValue(headers http.Header, keys ...string) string {
+	if headers == nil {
+		return ""
+	}
+	for _, key := range keys {
+		if value := strings.TrimSpace(headers.Get(key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func requestBodyBytesForLog(ctx context.Context, model string, req *http.Request) []byte {
 	if req == nil {
 		return nil
 	}
@@ -155,6 +265,9 @@ func requestBodyBytesForLog(req *http.Request) []byte {
 			if errRead == nil {
 				return data
 			}
+			if req.Body == nil {
+				logCodexRequestBodyReadError(ctx, "request.translated.read", model, req, errRead)
+			}
 		}
 	}
 	if req.Body == nil {
@@ -162,6 +275,7 @@ func requestBodyBytesForLog(req *http.Request) []byte {
 	}
 	data, err := io.ReadAll(req.Body)
 	if err != nil {
+		logCodexRequestBodyReadError(ctx, "request.translated.read", model, req, err)
 		return nil
 	}
 	req.Body = io.NopCloser(bytes.NewReader(data))
@@ -257,7 +371,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return resp, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
-	logCodexRawJSON(ctx, "request.translated", baseModel, requestBodyBytesForLog(httpReq))
+	logCodexRawJSON(ctx, "request.translated", baseModel, requestBodyBytesForLog(ctx, baseModel, httpReq))
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -288,17 +402,22 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
+		b, readErr := io.ReadAll(httpResp.Body)
+		if readErr != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
+			logCodexResponseBodyReadError(ctx, "response.upstream.error.read", baseModel, httpResp, b, readErr)
+		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		logCodexRawJSON(ctx, "response.upstream", baseModel, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = newCodexStatusErr(httpResp.StatusCode, b)
 		return resp, err
 	}
-	data, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
+	data, readErr := io.ReadAll(httpResp.Body)
+	if readErr != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, readErr)
+		logCodexResponseBodyReadError(ctx, "response.upstream.read", baseModel, httpResp, data, readErr)
+		return resp, readErr
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	logCodexRawJSON(ctx, "response.upstream", baseModel, data)
@@ -408,7 +527,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg)
-	logCodexRawJSON(ctx, "request.translated", baseModel, requestBodyBytesForLog(httpReq))
+	logCodexRawJSON(ctx, "request.translated", baseModel, requestBodyBytesForLog(ctx, baseModel, httpReq))
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -439,17 +558,22 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
+		b, readErr := io.ReadAll(httpResp.Body)
+		if readErr != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
+			logCodexResponseBodyReadError(ctx, "response.upstream.error.read", baseModel, httpResp, b, readErr)
+		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		logCodexRawJSON(ctx, "response.upstream", baseModel, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = newCodexStatusErr(httpResp.StatusCode, b)
 		return resp, err
 	}
-	data, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
+	data, readErr := io.ReadAll(httpResp.Body)
+	if readErr != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, readErr)
+		logCodexResponseBodyReadError(ctx, "response.upstream.read", baseModel, httpResp, data, readErr)
+		return resp, readErr
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	logCodexRawJSON(ctx, "response.upstream", baseModel, data)
@@ -507,7 +631,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
-	logCodexRawJSON(ctx, "request.translated", baseModel, requestBodyBytesForLog(httpReq))
+	logCodexRawJSON(ctx, "request.translated", baseModel, requestBodyBytesForLog(ctx, baseModel, httpReq))
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -540,6 +664,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}
 		if readErr != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
+			logCodexResponseBodyReadError(ctx, "response.upstream.error.read", baseModel, httpResp, data, readErr)
 			return nil, readErr
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
