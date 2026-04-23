@@ -175,6 +175,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
+	logCodexRawJSON(ctx, "request.original", req.Model, originalPayload)
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
 
@@ -219,6 +220,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 
 	wsReqBody := buildCodexWebsocketRequestBody(body)
+	logCodexRawJSON(ctx, "request.translated", baseModel, wsReqBody)
 	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
@@ -336,6 +338,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			continue
 		}
 		helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
+		logCodexRawJSON(ctx, "response.upstream", baseModel, payload)
 
 		if wsErr, ok := parseCodexWebsocketError(payload); ok {
 			if sess != nil {
@@ -353,6 +356,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			}
 			var param any
 			out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, payload, &param)
+			logCodexRawJSON(ctx, "response.returned", req.Model, out)
 			resp = cliproxyexecutor.Response{Payload: out}
 			return resp, nil
 		}
@@ -379,6 +383,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
+	originalPayloadSource := req.Payload
+	if len(opts.OriginalRequest) > 0 {
+		originalPayloadSource = opts.OriginalRequest
+	}
+	originalPayload := originalPayloadSource
+	logCodexRawJSON(ctx, "request.original", req.Model, originalPayload)
 	body := req.Payload
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
@@ -413,6 +423,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 
 	wsReqBody := buildCodexWebsocketRequestBody(body)
+	logCodexRawJSON(ctx, "request.translated", baseModel, wsReqBody)
 	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
@@ -580,6 +591,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				continue
 			}
 			helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
+			logCodexRawJSON(ctx, "response.upstream", baseModel, payload)
 
 			if wsErr, ok := parseCodexWebsocketError(payload); ok {
 				terminateReason = "upstream_error"
@@ -604,6 +616,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			line := encodeCodexWebsocketAsSSE(payload)
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, body, body, line, &param)
 			for i := range chunks {
+				logCodexRawJSON(ctx, "response.returned", req.Model, chunks[i])
 				if !send(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
 					terminateReason = "context_done"
 					terminateErr = ctx.Err()

@@ -254,6 +254,7 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 		})
 		return
 	}
+	handlers.LogInboundRawJSON(c, OpenaiResponse, "http.request.received.responses", gjson.GetBytes(rawJSON, "model").String(), rawJSON)
 
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
@@ -276,6 +277,7 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 		})
 		return
 	}
+	handlers.LogInboundRawJSON(c, OpenaiResponse, "http.request.received.responses_compact", gjson.GetBytes(rawJSON, "model").String(), rawJSON)
 
 	streamResult := gjson.GetBytes(rawJSON, "stream")
 	if streamResult.Type == gjson.True {

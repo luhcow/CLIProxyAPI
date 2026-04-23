@@ -107,6 +107,7 @@ func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
 		})
 		return
 	}
+	handlers.LogInboundRawJSON(c, OpenAI, "http.request.received.chat_completions", gjson.GetBytes(rawJSON, "model").String(), rawJSON)
 
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
@@ -162,6 +163,7 @@ func (h *OpenAIAPIHandler) Completions(c *gin.Context) {
 		})
 		return
 	}
+	handlers.LogInboundRawJSON(c, OpenAI, "http.request.received.completions", gjson.GetBytes(rawJSON, "model").String(), rawJSON)
 
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")

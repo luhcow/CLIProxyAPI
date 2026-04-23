@@ -99,6 +99,75 @@ func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]
 	return completedDataPatched
 }
 
+func logCodexRawJSON(ctx context.Context, stage string, model string, payload []byte) {
+	entry := helps.LogWithRequestID(ctx).WithFields(log.Fields{
+		"provider": "codex",
+		"stage":    strings.TrimSpace(stage),
+	})
+	if trimmedModel := strings.TrimSpace(model); trimmedModel != "" {
+		entry = entry.WithField("model", trimmedModel)
+	}
+
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 {
+		entry.Info("rawjson=<empty>")
+		return
+	}
+
+	logged := false
+	lines := bytes.Split(trimmed, []byte("\n"))
+	if len(lines) > 1 || bytes.HasPrefix(bytes.TrimSpace(lines[0]), dataTag) {
+		for _, line := range lines {
+			line = bytes.TrimSpace(line)
+			if len(line) == 0 || bytes.HasPrefix(line, []byte("event:")) {
+				continue
+			}
+			if bytes.HasPrefix(line, dataTag) {
+				line = bytes.TrimSpace(line[len(dataTag):])
+			}
+			if len(line) == 0 || bytes.Equal(line, []byte("[DONE]")) {
+				continue
+			}
+			entry.Infof("rawjson=%s", string(line))
+			logged = true
+		}
+	}
+	if logged {
+		return
+	}
+
+	entry.Infof("rawjson=%s", string(trimmed))
+}
+
+func requestBodyBytesForLog(req *http.Request) []byte {
+	if req == nil {
+		return nil
+	}
+	if req.GetBody != nil {
+		body, err := req.GetBody()
+		if err == nil && body != nil {
+			defer func() {
+				if errClose := body.Close(); errClose != nil {
+					log.Errorf("codex executor: close cloned request body error: %v", errClose)
+				}
+			}()
+			data, errRead := io.ReadAll(body)
+			if errRead == nil {
+				return data
+			}
+		}
+	}
+	if req.Body == nil {
+		return nil
+	}
+	data, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil
+	}
+	req.Body = io.NopCloser(bytes.NewReader(data))
+	return data
+}
+
 // CodexExecutor is a stateless executor for Codex (OpenAI Responses API entrypoint).
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
 type CodexExecutor struct {
@@ -163,6 +232,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
+	logCodexRawJSON(ctx, "request.original", req.Model, originalPayload)
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
 
@@ -187,6 +257,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return resp, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+	logCodexRawJSON(ctx, "request.translated", baseModel, requestBodyBytesForLog(httpReq))
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -219,6 +290,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+		logCodexRawJSON(ctx, "response.upstream", baseModel, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = newCodexStatusErr(httpResp.StatusCode, b)
 		return resp, err
@@ -229,6 +301,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return resp, err
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+	logCodexRawJSON(ctx, "response.upstream", baseModel, data)
 
 	lines := bytes.Split(data, []byte("\n"))
 	outputItemsByIndex := make(map[int64][]byte)
@@ -288,6 +361,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 		var param any
 		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, completedData, &param)
+		logCodexRawJSON(ctx, "response.returned", req.Model, out)
 		resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 		return resp, nil
 	}
@@ -313,6 +387,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
+	logCodexRawJSON(ctx, "request.original", req.Model, originalPayload)
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
 
@@ -333,6 +408,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg)
+	logCodexRawJSON(ctx, "request.translated", baseModel, requestBodyBytesForLog(httpReq))
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -365,6 +441,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+		logCodexRawJSON(ctx, "response.upstream", baseModel, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = newCodexStatusErr(httpResp.StatusCode, b)
 		return resp, err
@@ -375,10 +452,12 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+	logCodexRawJSON(ctx, "response.upstream", baseModel, data)
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(data))
 	reporter.EnsurePublished(ctx)
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, data, &param)
+	logCodexRawJSON(ctx, "response.returned", req.Model, out)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil
 }
@@ -404,6 +483,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
+	logCodexRawJSON(ctx, "request.original", req.Model, originalPayload)
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
 
@@ -427,6 +507,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+	logCodexRawJSON(ctx, "request.translated", baseModel, requestBodyBytesForLog(httpReq))
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -462,6 +543,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			return nil, readErr
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+		logCodexRawJSON(ctx, "response.upstream", baseModel, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
 		err = newCodexStatusErr(httpResp.StatusCode, data)
 		return nil, err
@@ -482,6 +564,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+			logCodexRawJSON(ctx, "response.upstream", baseModel, line)
 			translatedLine := bytes.Clone(line)
 
 			if bytes.HasPrefix(line, dataTag) {
@@ -500,6 +583,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, translatedLine, &param)
 			for i := range chunks {
+				logCodexRawJSON(ctx, "response.returned", req.Model, chunks[i])
 				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
 			}
 		}

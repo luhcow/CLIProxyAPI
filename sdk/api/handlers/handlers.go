@@ -22,6 +22,7 @@ import (
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 )
 
@@ -51,6 +52,34 @@ const (
 	defaultStreamingKeepAliveSeconds = 0
 	defaultStreamingBootstrapRetries = 0
 )
+
+// LogInboundRawJSON writes the raw request body received by the HTTP handler.
+func LogInboundRawJSON(c *gin.Context, provider string, stage string, model string, payload []byte) {
+	entry := log.NewEntry(log.StandardLogger())
+	if c != nil {
+		if requestID := logging.GetGinRequestID(c); requestID != "" {
+			entry = entry.WithField("request_id", requestID)
+		}
+	}
+
+	if trimmedProvider := strings.TrimSpace(provider); trimmedProvider != "" {
+		entry = entry.WithField("provider", trimmedProvider)
+	}
+	if trimmedStage := strings.TrimSpace(stage); trimmedStage != "" {
+		entry = entry.WithField("stage", trimmedStage)
+	}
+	if trimmedModel := strings.TrimSpace(model); trimmedModel != "" {
+		entry = entry.WithField("model", trimmedModel)
+	}
+
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 {
+		entry.Info("rawjson=<empty>")
+		return
+	}
+
+	entry.Infof("rawjson=%s", string(trimmed))
+}
 
 type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
