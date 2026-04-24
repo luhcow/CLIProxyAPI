@@ -91,6 +91,56 @@ func TestConvertCodexResponseToOpenAI_ToolCallArgumentsDeltaOmitsNullContentFiel
 	}
 }
 
+func TestConvertCodexResponseToOpenAI_CustomToolCallStreamsAsToolCall(t *testing.T) {
+	ctx := context.Background()
+	var param any
+
+	out := ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.output_item.added","item":{"type":"custom_tool_call","call_id":"call_123","name":"ApplyPatch","input":""}}`), &param)
+	if len(out) != 1 {
+		t.Fatalf("expected custom tool call announcement chunk, got %d", len(out))
+	}
+	if got := gjson.GetBytes(out[0], "choices.0.delta.tool_calls.0.id").String(); got != "call_123" {
+		t.Fatalf("expected tool call id %q, got %q; chunk=%s", "call_123", got, string(out[0]))
+	}
+	if got := gjson.GetBytes(out[0], "choices.0.delta.tool_calls.0.function.name").String(); got != "ApplyPatch" {
+		t.Fatalf("expected tool call name %q, got %q; chunk=%s", "ApplyPatch", got, string(out[0]))
+	}
+
+	out = ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.custom_tool_call_input.delta","delta":"*** Begin Patch\n"}`), &param)
+	if len(out) != 1 {
+		t.Fatalf("expected custom tool input delta chunk, got %d", len(out))
+	}
+	if got := gjson.GetBytes(out[0], "choices.0.delta.tool_calls.0.function.arguments").String(); got != "*** Begin Patch\n" {
+		t.Fatalf("expected custom tool input delta, got %q; chunk=%s", got, string(out[0]))
+	}
+
+	out = ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.completed","response":{"status":"completed"}}`), &param)
+	if len(out) != 1 {
+		t.Fatalf("expected completion chunk, got %d", len(out))
+	}
+	if got := gjson.GetBytes(out[0], "choices.0.finish_reason").String(); got != "tool_calls" {
+		t.Fatalf("expected finish_reason %q, got %q; chunk=%s", "tool_calls", got, string(out[0]))
+	}
+}
+
+func TestConvertCodexResponseToOpenAI_CustomToolCallDoneFallback(t *testing.T) {
+	ctx := context.Background()
+	var param any
+
+	out := ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.output_item.added","item":{"type":"custom_tool_call","call_id":"call_123","name":"ApplyPatch","input":""}}`), &param)
+	if len(out) != 1 {
+		t.Fatalf("expected custom tool call announcement chunk, got %d", len(out))
+	}
+
+	out = ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.custom_tool_call_input.done","input":"*** Begin Patch\n*** End Patch\n"}`), &param)
+	if len(out) != 1 {
+		t.Fatalf("expected custom tool input done fallback chunk, got %d", len(out))
+	}
+	if got := gjson.GetBytes(out[0], "choices.0.delta.tool_calls.0.function.arguments").String(); got != "*** Begin Patch\n*** End Patch\n" {
+		t.Fatalf("expected full custom tool input, got %q; chunk=%s", got, string(out[0]))
+	}
+}
+
 func TestConvertCodexResponseToOpenAI_StreamPartialImageEmitsDeltaImages(t *testing.T) {
 	ctx := context.Background()
 	var param any
@@ -147,5 +197,25 @@ func TestConvertCodexResponseToOpenAI_NonStreamImageGenerationCallAddsMessageIma
 	gotURL := gjson.GetBytes(out, "choices.0.message.images.0.image_url.url").String()
 	if gotURL != "data:image/png;base64,aGVsbG8=" {
 		t.Fatalf("expected image url %q, got %q; chunk=%s", "data:image/png;base64,aGVsbG8=", gotURL, string(out))
+	}
+}
+
+func TestConvertCodexResponseToOpenAINonStream_CustomToolCallAddsToolCall(t *testing.T) {
+	ctx := context.Background()
+
+	raw := []byte(`{"type":"response.completed","response":{"id":"resp_123","created_at":1700000000,"model":"gpt-5.4","status":"completed","output":[{"type":"custom_tool_call","call_id":"call_123","name":"ApplyPatch","input":"*** Begin Patch\n*** End Patch\n"}]}}`)
+	out := ConvertCodexResponseToOpenAINonStream(ctx, "gpt-5.4", nil, nil, raw, nil)
+
+	if got := gjson.GetBytes(out, "choices.0.message.tool_calls.0.id").String(); got != "call_123" {
+		t.Fatalf("expected tool call id %q, got %q; chunk=%s", "call_123", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "choices.0.message.tool_calls.0.function.name").String(); got != "ApplyPatch" {
+		t.Fatalf("expected tool call name %q, got %q; chunk=%s", "ApplyPatch", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "choices.0.message.tool_calls.0.function.arguments").String(); got != "*** Begin Patch\n*** End Patch\n" {
+		t.Fatalf("expected custom tool input, got %q; chunk=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "choices.0.finish_reason").String(); got != "tool_calls" {
+		t.Fatalf("expected finish_reason %q, got %q; chunk=%s", "tool_calls", got, string(out))
 	}
 }

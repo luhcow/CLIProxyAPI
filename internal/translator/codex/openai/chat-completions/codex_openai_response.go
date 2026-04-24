@@ -169,11 +169,12 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		template, _ = sjson.SetBytes(template, "choices.0.native_finish_reason", finishReason)
 	} else if dataType == "response.output_item.added" {
 		itemResult := rootResult.Get("item")
-		if !itemResult.Exists() || itemResult.Get("type").String() != "function_call" {
+		itemType := itemResult.Get("type").String()
+		if !itemResult.Exists() || !isOpenAIToolCallItem(itemType) {
 			return [][]byte{}
 		}
 
-		// Increment index for this new function call item.
+		// Increment index for this new tool call item.
 		(*param).(*ConvertCliToOpenAIParams).FunctionCallIndex++
 		(*param).(*ConvertCliToOpenAIParams).HasReceivedArgumentsDelta = false
 		(*param).(*ConvertCliToOpenAIParams).HasToolCallAnnounced = true
@@ -195,7 +196,7 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls", []byte(`[]`))
 		template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls.-1", functionCallItemTemplate)
 
-	} else if dataType == "response.function_call_arguments.delta" {
+	} else if dataType == "response.function_call_arguments.delta" || dataType == "response.custom_tool_call_input.delta" {
 		(*param).(*ConvertCliToOpenAIParams).HasReceivedArgumentsDelta = true
 
 		deltaValue := rootResult.Get("delta").String()
@@ -206,7 +207,7 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls", []byte(`[]`))
 		template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls.-1", functionCallItemTemplate)
 
-	} else if dataType == "response.function_call_arguments.done" {
+	} else if dataType == "response.function_call_arguments.done" || dataType == "response.custom_tool_call_input.done" {
 		if (*param).(*ConvertCliToOpenAIParams).HasReceivedArgumentsDelta {
 			// Arguments were already streamed via delta events; nothing to emit.
 			return [][]byte{}
@@ -214,6 +215,9 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 
 		// Fallback: no delta events were received, emit the full arguments as a single chunk.
 		fullArgs := rootResult.Get("arguments").String()
+		if dataType == "response.custom_tool_call_input.done" {
+			fullArgs = rootResult.Get("input").String()
+		}
 		functionCallItemTemplate := []byte(`{"index":0,"function":{"arguments":""}}`)
 		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "index", (*param).(*ConvertCliToOpenAIParams).FunctionCallIndex)
 		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.arguments", fullArgs)
@@ -262,7 +266,7 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 			template, _ = sjson.SetRawBytes(template, "choices.0.delta.images.-1", imagePayload)
 			return [][]byte{template}
 		}
-		if itemType != "function_call" {
+		if !isOpenAIToolCallItem(itemType) {
 			return [][]byte{}
 		}
 
@@ -289,7 +293,11 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		}
 		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.name", name)
 
-		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.arguments", itemResult.Get("arguments").String())
+		args := itemResult.Get("arguments").String()
+		if itemType == "custom_tool_call" {
+			args = itemResult.Get("input").String()
+		}
+		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.arguments", args)
 		template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 		template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls.-1", functionCallItemTemplate)
 
@@ -397,7 +405,7 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 						}
 					}
 				}
-			case "function_call":
+			case "function_call", "custom_tool_call":
 				// Handle function call content
 				functionCallTemplate := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
 
@@ -416,6 +424,8 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 
 				if argsResult := outputItem.Get("arguments"); argsResult.Exists() {
 					functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "function.arguments", argsResult.String())
+				} else if inputResult := outputItem.Get("input"); inputResult.Exists() {
+					functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "function.arguments", inputResult.String())
 				}
 
 				toolCalls = append(toolCalls, functionCallTemplate)
@@ -510,6 +520,10 @@ func buildReverseMapFromOriginalOpenAI(original []byte) map[string]string {
 		}
 	}
 	return rev
+}
+
+func isOpenAIToolCallItem(itemType string) bool {
+	return itemType == "function_call" || itemType == "custom_tool_call"
 }
 
 func mimeTypeFromCodexOutputFormat(outputFormat string) string {
